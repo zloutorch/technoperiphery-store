@@ -5,225 +5,78 @@ const db = require('./db');
 require('dotenv').config();
 const { sendOrderReceipt } = require('./sendOrderReceipt');
 const { generateReportDocx } = require('./reportGenerator');
-const { sendConfirmationEmail } = require('./mailer'); // путь зависит от расположения
-
+const { sendConfirmationEmail } = require('./mailer');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // Проверка сервера
-app.get('/', (req, res) => {
+app.get('/', (_, res) => {
   res.send('Сервер работает!');
 });
 
 // Получить все товары
-app.get('/products', (req, res) => {
-  db.query('SELECT * FROM products', (err, results) => {
-    if (err) {
-      console.log('Ошибка запроса:', err.message);
-      return res.status(500).json({ error: 'Ошибка сервера' });
-    }
+app.get('/products', async (req, res) => {
+  try {
+    const [results] = await db.query('SELECT * FROM products');
     res.json(results);
-  });
-});
-// Оформить заказ
-app.post('/orders', (req, res) => {
-  const { name, address, phone, comment, items, userId } = req.body;
-
-  if (!userId) {
-    return res.status(401).json({ error: 'Только авторизованные пользователи могут оформлять заказы.' });
+  } catch (err) {
+    console.error('Ошибка запроса:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
   }
-
-  const total = items.reduce((sum, item) => sum + parseFloat(item.price) * item.quantity, 0);
-
-  const insertOrderQuery = `INSERT INTO orders (user_id, total_price, created_at) VALUES (?, ?, NOW())`;
-
-  db.query(insertOrderQuery, [userId, total], (err, result) => {
-    if (err) {
-      console.error('Ошибка добавления заказа:', err.message);
-      return res.status(500).json({ error: 'Ошибка сервера при создании заказа' });
-    }
-
-    const orderId = result.insertId;
-    const values = items.map(item => [orderId, item.id, item.quantity]);
-
-    db.query(`INSERT INTO order_items (order_id, product_id, quantity) VALUES ?`, [values], (err) => {
-      if (err) {
-        console.error('Ошибка добавления товаров:', err.message);
-        return res.status(500).json({ error: 'Ошибка сервера при добавлении товаров' });
-      }
-
-      // Уменьшаем количество на складе
-      items.forEach(item => {
-        db.query('UPDATE products SET stock = stock - ? WHERE id = ?', [item.quantity, item.id], (err) => {
-          if (err) console.error(`Ошибка обновления stock для товара ${item.id}:`, err.message);
-        });
-      });
-
-      // Получаем полные названия товаров из БД
-      const productIds = items.map(i => i.id);
-      db.query('SELECT id, name FROM products WHERE id IN (?)', [productIds], (err2, productResults) => {
-        if (err2) {
-          console.error('Ошибка получения названий товаров:', err2.message);
-          return res.status(500).json({ error: 'Ошибка при получении названий товаров' });
-        }
-
-        // Склеиваем данные
-        const fullItems = items.map(item => {
-          const match = productResults.find(p => p.id === item.id);
-          return {
-            ...item,
-            name: match?.name || '—'
-          };
-        });
-
-        // Получаем данные пользователя
-        db.query('SELECT name, email, phone FROM users WHERE id = ?', [userId], async (err3, results) => {
-          if (!err3 && results.length > 0) {
-            const user = results[0];
-            try {
-              await sendOrderReceipt(user, { items: fullItems, total_price: total });
-              console.log('✅ Чек отправлен на почту');
-            } catch (e) {
-              console.error('❌ Ошибка отправки чека:', e.message);
-            }
-          }
-        });
-
-        res.json({ message: 'Заказ успешно оформлен', orderId });
-      });
-    });
-  });
 });
 
-// Получить заказы конкретного пользователя
-app.get('/orders/user/:userId', (req, res) => {
-  const userId = req.params.userId;
-
-  const ordersQuery = `
-   SELECT o.id, o.total_price, o.created_at, o.delivery_status,
-       p.name, p.price, p.image_url, oi.quantity
-
-FROM orders o
-JOIN order_items oi ON o.id = oi.order_id
-JOIN products p ON oi.product_id = p.id
-WHERE o.user_id = ?
-ORDER BY o.created_at DESC
-
-  `;
-
-  db.query(ordersQuery, [userId], (err, results) => {
-    if (err) {
-      console.error('Ошибка при получении заказов:', err.message);
-      return res.status(500).json({ error: 'Ошибка при загрузке заказов' });
-    }
-
-    // Группируем заказы по id
-    const grouped = {};
-    results.forEach(row => {
-      if (!grouped[row.id]) {
-        grouped[row.id] = {
-          id: row.id,
-          total_price: row.total_price,
-          created_at: row.created_at,
-           delivery_status: row.delivery_status,
-          items: []
-        };
-      }
-      grouped[row.id].items.push({ name: row.name, price: row.price, image_url: row.image_url, quantity: row.quantity });
-
-    });
-
-    res.json(Object.values(grouped));
-  });
-});
-// Удалить один заказ по ID
-app.delete('/orders/:orderId', (req, res) => {
-  const orderId = req.params.orderId;
-
-  const deleteItemsQuery = 'DELETE FROM order_items WHERE order_id = ?';
-  db.query(deleteItemsQuery, [orderId], (err) => {
-    if (err) {
-      console.error('Ошибка при удалении товаров заказа:', err.message);
-      return res.status(500).json({ error: 'Ошибка при удалении товаров' });
-    }
-
-    const deleteOrderQuery = 'DELETE FROM orders WHERE id = ?';
-    db.query(deleteOrderQuery, [orderId], (err) => {
-      if (err) {
-        console.error('Ошибка при удалении заказа:', err.message);
-        return res.status(500).json({ error: 'Ошибка при удалении заказа' });
-      }
-
-      res.json({ message: 'Заказ удалён' });
-    });
-  });
-});
-app.get('/products/:id', (req, res) => {
-  const productId = req.params.id;
-  db.query('SELECT * FROM products WHERE id = ?', [productId], (err, results) => {
-    if (err) return res.status(500).json({ error: 'Ошибка сервера' });
+// Получить товар по ID
+app.get('/products/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const [results] = await db.query('SELECT * FROM products WHERE id = ?', [id]);
     if (results.length === 0) return res.status(404).json({ error: 'Товар не найден' });
     res.json(results[0]);
-  });
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
 });
 
-
-
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен на порту ${PORT}`);
-});
-app.post('/register', (req, res) => {
+// Регистрация
+app.post('/register', async (req, res) => {
   const { name, email, phone, password } = req.body;
+  try {
+    const [result] = await db.query(
+      'INSERT INTO users (name, email, phone, password, is_verified) VALUES (?, ?, ?, ?, 0)',
+      [name, email, phone, password]
+    );
 
-  const query = 'INSERT INTO users (name, email, phone, password, is_verified) VALUES (?, ?, ?, ?, 0)';
-  db.query(query, [name, email, phone, password], (err, result) => {
-    if (err) {
-      console.error('Ошибка регистрации:', err.message);
-      return res.status(500).json({ error: 'Ошибка сервера' });
-    }
-    const newUser = {
-      id: result.insertId,
-      name,
-      email,
-      phone
-    };
-  
-    axios.post('http://localhost:8000/notify', newUser)
-      .catch(err => {
-        console.error('Ошибка отправки уведомления в Telegram:', err.message);
-      });
-  
+    const newUser = { id: result.insertId, name, email, phone };
+
+    axios.post('http://localhost:8000/notify', newUser).catch(console.error);
+
     res.json({ message: 'Регистрация прошла успешно. Ожидайте подтверждения от администратора.' });
-  });
+  } catch (err) {
+    console.error('Ошибка регистрации:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
 });
-app.post('/login', (req, res) => {
+
+// Вход
+app.post('/login', async (req, res) => {
   const { identifier, password } = req.body;
+  try {
+    const [results] = await db.query(
+      'SELECT * FROM users WHERE (email = ? OR phone = ?) AND password = ?',
+      [identifier, identifier, password]
+    );
 
-  const query = 'SELECT * FROM users WHERE (email = ? OR phone = ?) AND password = ?';
-  db.query(query, [identifier, identifier, password], (err, results) => {
-    if (err) {
-      console.error('Ошибка входа:', err.message);
-      return res.status(500).json({ error: 'Ошибка сервера' });
-    }
-
-    if (results.length === 0) {
-      return res.status(401).json({ error: 'Неверные данные для входа' });
-    }
+    if (results.length === 0) return res.status(401).json({ error: 'Неверные данные для входа' });
 
     const user = results[0];
-
-    // Добавляем проверку подтверждения
-    if (user.is_verified === 0) {
+    if (user.is_verified === 0)
       return res.status(403).json({ error: 'Аккаунт ещё не подтверждён администратором' });
-    }
 
-    // Отправляем все необходимые поля на фронт
-    res.json({ 
-      message: 'Успешный вход', 
-      user: { 
+    res.json({
+      message: 'Успешный вход',
+      user: {
         id: user.id,
         name: user.name,
         email: user.email,
@@ -232,197 +85,277 @@ app.post('/login', (req, res) => {
         isVerified: user.is_verified === 1
       }
     });
-  });
+  } catch (err) {
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
 });
 
+// Оформить заказ
+app.post('/orders', async (req, res) => {
+  const { name, address, phone, comment, items, userId } = req.body;
+  if (!userId) return res.status(401).json({ error: 'Авторизуйтесь' });
 
-app.get('/api/admin/users', (req, res) => {
-  db.query('SELECT id, name, email, phone, is_verified FROM users', (err, results) => {
-    if (err) {
-      console.error('Ошибка получения пользователей:', err.message);
-      return res.status(500).json({ error: 'Ошибка сервера' });
+  const total = items.reduce((sum, i) => sum + parseFloat(i.price) * i.quantity, 0);
+
+  try {
+    const [result] = await db.query(
+      'INSERT INTO orders (user_id, total_price, created_at) VALUES (?, ?, NOW())',
+      [userId, total]
+    );
+
+    const orderId = result.insertId;
+    const values = items.map(i => [orderId, i.id, i.quantity]);
+    await db.query('INSERT INTO order_items (order_id, product_id, quantity) VALUES ?', [values]);
+
+    // Обновление stock
+    for (const item of items) {
+      await db.query('UPDATE products SET stock = stock - ? WHERE id = ?', [item.quantity, item.id]);
     }
-    res.json(results);
-  });
+
+    const [productResults] = await db.query(
+      'SELECT id, name FROM products WHERE id IN (?)',
+      [items.map(i => i.id)]
+    );
+
+    const fullItems = items.map(i => ({
+      ...i,
+      name: productResults.find(p => p.id === i.id)?.name || '—'
+    }));
+
+    const [userResults] = await db.query(
+      'SELECT name, email, phone FROM users WHERE id = ?',
+      [userId]
+    );
+
+    if (userResults.length > 0) {
+      await sendOrderReceipt(userResults[0], { items: fullItems, total_price: total });
+    }
+
+    res.json({ message: 'Заказ успешно оформлен', orderId });
+  } catch (err) {
+    console.error('Ошибка оформления заказа:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
 });
-app.post('/api/admin/verify-user/:id', (req, res) => {
-  const userId = req.params.id;
 
-  db.query('SELECT email, name FROM users WHERE id = ?', [userId], (err, results) => {
-    if (err || results.length === 0) {
-      console.error('Ошибка получения пользователя:', err?.message);
-      return res.status(500).json({ error: 'Пользователь не найден' });
-    }
+// Заказы пользователя
+app.get('/orders/user/:userId', async (req, res) => {
+  const { userId } = req.params;
+  try {
+    const [results] = await db.query(`
+      SELECT o.id, o.total_price, o.created_at, o.delivery_status,
+             p.name, p.price, p.image_url, oi.quantity
+      FROM orders o
+      JOIN order_items oi ON o.id = oi.order_id
+      JOIN products p ON oi.product_id = p.id
+      WHERE o.user_id = ?
+      ORDER BY o.created_at DESC
+    `, [userId]);
 
-    const user = results[0];
-
-    db.query('UPDATE users SET is_verified = 1 WHERE id = ?', [userId], (err) => {
-      if (err) {
-        console.error('Ошибка подтверждения пользователя:', err.message);
-        return res.status(500).json({ error: 'Ошибка сервера' });
+    const grouped = {};
+    results.forEach(row => {
+      if (!grouped[row.id]) {
+        grouped[row.id] = {
+          id: row.id,
+          total_price: row.total_price,
+          created_at: row.created_at,
+          delivery_status: row.delivery_status,
+          items: []
+        };
       }
-
-      // ✅ Сразу отправляем клиенту ответ
-      res.json({ message: 'Пользователь подтверждён' });
-
-      // 📧 А письмо отправляем уже отдельно — не блокируем
-      sendConfirmationEmail(user.email, user.name)
-        .then(() => console.log('Письмо отправлено'))
-        .catch(err => console.error('Ошибка отправки письма:', err.message));
+      grouped[row.id].items.push({
+        name: row.name,
+        price: row.price,
+        image_url: row.image_url,
+        quantity: row.quantity
+      });
     });
-  });
+
+    res.json(Object.values(grouped));
+  } catch (err) {
+    console.error('Ошибка получения заказов:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
 });
 
+// Удаление заказа
+app.delete('/orders/:orderId', async (req, res) => {
+  const { orderId } = req.params;
+  try {
+    await db.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
+    await db.query('DELETE FROM orders WHERE id = ?', [orderId]);
+    res.json({ message: 'Заказ удалён' });
+  } catch (err) {
+    console.error('Ошибка удаления заказа:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+// Получить всех пользователей
+app.get('/api/admin/users', async (_, res) => {
+  try {
+    const [results] = await db.query('SELECT id, name, email, phone, is_verified FROM users');
+    res.json(results);
+  } catch (err) {
+    console.error('Ошибка получения пользователей:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
 
-app.delete('/api/admin/delete-user/:id', (req, res) => {
-  const userId = req.params.id;
-  db.query('DELETE FROM users WHERE id = ?', [userId], (err) => {
-    if (err) {
-      console.error('Ошибка удаления пользователя:', err.message);
-      return res.status(500).json({ error: 'Ошибка сервера' });
-    }
+// Подтвердить пользователя
+app.post('/api/admin/verify-user/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    const [users] = await db.query('SELECT email, name FROM users WHERE id = ?', [id]);
+    if (users.length === 0) return res.status(404).json({ error: 'Пользователь не найден' });
+
+    await db.query('UPDATE users SET is_verified = 1 WHERE id = ?', [id]);
+    res.json({ message: 'Пользователь подтверждён' });
+
+    // отправка письма отдельно
+    sendConfirmationEmail(users[0].email, users[0].name)
+      .then(() => console.log('Письмо отправлено'))
+      .catch(err => console.error('Ошибка отправки письма:', err.message));
+  } catch (err) {
+    console.error('Ошибка подтверждения пользователя:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
+
+// Удалить пользователя
+app.delete('/api/admin/delete-user/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await db.query('DELETE FROM users WHERE id = ?', [id]);
     res.json({ message: 'Пользователь удалён' });
-  });
+  } catch (err) {
+    console.error('Ошибка удаления пользователя:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
 });
 
-app.get('/api/admin/orders', (req, res) => {
-  const query = `
-    SELECT o.id, o.total_price, o.created_at, o.delivery_status, u.email AS user_email
-    FROM orders o
-    JOIN users u ON o.user_id = u.id
-    ORDER BY o.created_at DESC
-  `;
+// Получить все заказы
+app.get('/api/admin/orders', async (_, res) => {
+  try {
+    const [orders] = await db.query(`
+      SELECT o.id, o.total_price, o.created_at, o.delivery_status, u.email AS user_email
+      FROM orders o
+      JOIN users u ON o.user_id = u.id
+      ORDER BY o.created_at DESC
+    `);
 
-  db.query(query, (err, orders) => {
-    if (err) {
-      console.error('Ошибка получения заказов:', err.message);
-      return res.status(500).json({ error: 'Ошибка сервера' });
-    }
+    if (!orders.length) return res.json([]);
 
-    // Теперь подтянем товары в заказах
     const orderIds = orders.map(o => o.id);
-    if (orderIds.length === 0) return res.json([]); // если заказов нет
-
-    const itemsQuery = `
+    const [items] = await db.query(`
       SELECT oi.order_id, p.name, p.price
       FROM order_items oi
       JOIN products p ON oi.product_id = p.id
       WHERE oi.order_id IN (?)
-    `;
+    `, [orderIds]);
 
-    db.query(itemsQuery, [orderIds], (err, items) => {
-      if (err) {
-        console.error('Ошибка получения товаров в заказах:', err.message);
-        return res.status(500).json({ error: 'Ошибка сервера' });
-      }
-
-      // группируем товары по заказам
-      const groupedItems = {};
-      items.forEach(item => {
-        if (!groupedItems[item.order_id]) {
-          groupedItems[item.order_id] = [];
-        }
-        groupedItems[item.order_id].push({ name: item.name, price: item.price });
-      });
-
-      // соединяем заказы с товарами
-      const ordersWithItems = orders.map(order => ({
-        ...order,
-        products: groupedItems[order.id] || []
-      }));
-
-      res.json(ordersWithItems);
+    const grouped = {};
+    items.forEach(i => {
+      if (!grouped[i.order_id]) grouped[i.order_id] = [];
+      grouped[i.order_id].push({ name: i.name, price: i.price });
     });
-  });
+
+    const combined = orders.map(o => ({
+      ...o,
+      products: grouped[o.id] || []
+    }));
+
+    res.json(combined);
+  } catch (err) {
+    console.error('Ошибка получения заказов:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
 });
-app.post('/api/admin/orders/:id/status', (req, res) => {
-  const orderId = req.params.id;
+
+// Изменить статус доставки
+app.post('/api/admin/orders/:id/status', async (req, res) => {
+  const { id } = req.params;
   const { status } = req.body;
-
-  db.query('UPDATE orders SET delivery_status = ? WHERE id = ?', [status, orderId], (err) => {
-    if (err) {
-      console.error('Ошибка обновления статуса доставки:', err.message);
-      return res.status(500).json({ error: 'Ошибка сервера' });
-    }
+  try {
+    await db.query('UPDATE orders SET delivery_status = ? WHERE id = ?', [status, id]);
     res.json({ success: true });
-  });
+  } catch (err) {
+    console.error('Ошибка изменения статуса:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
 });
 
-app.get('/api/admin/products', (req, res) => {
-  db.query('SELECT id, name, price, category, description, image_url, stock FROM products', (err, results) => {
-    if (err) {
-      console.error('Ошибка получения товаров:', err.message);
-      return res.status(500).json({ error: 'Ошибка сервера' });
-    }
+// Получить список товаров
+app.get('/api/admin/products', async (_, res) => {
+  try {
+    const [results] = await db.query(
+      'SELECT id, name, price, category, description, image_url, stock FROM products'
+    );
     res.json(results);
-  });
+  } catch (err) {
+    console.error('Ошибка получения товаров:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
 });
 
-app.post('/api/admin/add-product', (req, res) => {
-  const { name, price, description, category, image_url, stock} = req.body;
-
-  const query = `
-    INSERT INTO products (name, price, description, category, image_url, stock)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `;
-
-  db.query(query, [name, price, description, category, image_url, stock || 0], (err) => {
-    if (err) {
-      console.error('Ошибка добавления товара:', err.message);
-      return res.status(500).json({ error: 'Ошибка сервера' });
-    }
-    res.json({ message: 'Товар успешно добавлен' });
-  });
-});
-
-app.delete('/api/admin/product/:id', (req, res) => {
-  const productId = req.params.id;
-  db.query('DELETE FROM products WHERE id = ?', [productId], (err) => {
-    if (err) {
-      console.error('Ошибка удаления товара:', err.message);
-      return res.status(500).json({ error: 'Ошибка сервера' });
-    }
-    res.json({ message: 'Товар удалён' });
-  });
-});
-app.put('/api/admin/product/:id', (req, res) => {
-  const productId = req.params.id;
+// Добавить товар
+app.post('/api/admin/add-product', async (req, res) => {
   const { name, price, description, category, image_url, stock } = req.body;
-
-  const query = `
-    UPDATE products
-    SET name = ?, price = ?, description = ?, category = ?, image_url = ?, stock = ?
-    WHERE id = ?
-  `;
-
-  db.query(query, [name, price, description, category, image_url,, stock || 0, productId], (err, result) => {
-    if (err) {
-      console.error('Ошибка обновления товара:', err.message);
-      return res.status(500).json({ error: 'Ошибка при обновлении товара' });
-    }
-
-    res.json({ message: 'Товар успешно обновлён' });
-  });
+  try {
+    await db.query(`
+      INSERT INTO products (name, price, description, category, image_url, stock)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `, [name, price, description, category, image_url, stock || 0]);
+    res.json({ message: 'Товар успешно добавлен' });
+  } catch (err) {
+    console.error('Ошибка добавления товара:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
 });
 
-app.post('/api/admin/send-check/:orderId', (req, res) => {
-  const orderId = req.params.orderId;
+// Удалить товар
+app.delete('/api/admin/product/:id', async (req, res) => {
+  const { id } = req.params;
+  try {
+    await db.query('DELETE FROM products WHERE id = ?', [id]);
+    res.json({ message: 'Товар удалён' });
+  } catch (err) {
+    console.error('Ошибка удаления товара:', err.message);
+    res.status(500).json({ error: 'Ошибка сервера' });
+  }
+});
 
-  const query = `
-    SELECT o.total_price, o.created_at, u.name, u.email, u.phone,
-           p.name AS product_name, p.price
-    FROM orders o
-    JOIN users u ON o.user_id = u.id
-    JOIN order_items oi ON o.id = oi.order_id
-    JOIN products p ON oi.product_id = p.id
-    WHERE o.id = ?
-  `;
+// Редактировать товар
+app.put('/api/admin/product/:id', async (req, res) => {
+  const { id } = req.params;
+  const { name, price, description, category, image_url, stock } = req.body;
+  try {
+    await db.query(`
+      UPDATE products
+      SET name = ?, price = ?, description = ?, category = ?, image_url = ?, stock = ?
+      WHERE id = ?
+    `, [name, price, description, category, image_url, stock || 0, id]);
+    res.json({ message: 'Товар успешно обновлён' });
+  } catch (err) {
+    console.error('Ошибка обновления товара:', err.message);
+    res.status(500).json({ error: 'Ошибка при обновлении товара' });
+  }
+});
 
-  db.query(query, [orderId], async (err, results) => {
-    if (err || results.length === 0) {
-      console.error('Ошибка получения данных заказа:', err?.message);
-      return res.status(500).json({ error: 'Ошибка при получении заказа' });
-    }
+// Отправить чек
+app.post('/api/admin/send-check/:orderId', async (req, res) => {
+  const { orderId } = req.params;
+  try {
+    const [results] = await db.query(`
+      SELECT o.total_price, o.created_at, u.name, u.email, u.phone,
+             p.name AS product_name, p.price
+      FROM orders o
+      JOIN users u ON o.user_id = u.id
+      JOIN order_items oi ON o.id = oi.order_id
+      JOIN products p ON oi.product_id = p.id
+      WHERE o.id = ?
+    `, [orderId]);
+
+    if (!results.length) return res.status(404).json({ error: 'Заказ не найден' });
 
     const user = {
       name: results[0].name,
@@ -435,46 +368,38 @@ app.post('/api/admin/send-check/:orderId', (req, res) => {
       total_price: results[0].total_price
     };
 
-    try {
-      await sendOrderReceipt(user, order);
-      res.json({ message: 'Чек успешно отправлен' });
-    } catch (e) {
-      console.error('Ошибка отправки чека:', e.message);
-      res.status(500).json({ error: 'Ошибка при отправке письма' });
-    }
-  });
+    await sendOrderReceipt(user, order);
+    res.json({ message: 'Чек успешно отправлен' });
+  } catch (err) {
+    console.error('Ошибка отправки чека:', err.message);
+    res.status(500).json({ error: 'Ошибка при отправке письма' });
+  }
 });
-app.post('/api/admin/generate-report', (req, res) => {
+
+// Сформировать отчёт
+app.post('/api/admin/generate-report', async (req, res) => {
   const { from, to } = req.body;
-  console.log('⏱️ Даты отчёта:', from, to);
+  try {
+    const [results] = await db.query(`
+      SELECT o.id, o.created_at, o.total_price, u.name, u.email, p.name AS product_name, p.price
+      FROM orders o
+      JOIN users u ON o.user_id = u.id
+      JOIN order_items oi ON o.id = oi.order_id
+      JOIN products p ON oi.product_id = p.id
+      WHERE o.created_at BETWEEN ? AND ?
+      ORDER BY o.created_at DESC
+    `, [from, to]);
 
-  const query = `
-    SELECT o.id, o.created_at, o.total_price, u.name, u.email, p.name AS product_name, p.price
-    FROM orders o
-    JOIN users u ON o.user_id = u.id
-    JOIN order_items oi ON o.id = oi.order_id
-    JOIN products p ON oi.product_id = p.id
-    WHERE o.created_at BETWEEN ? AND ?
-    ORDER BY o.created_at DESC
-  `;
+    if (!results.length) return res.status(404).json({ error: 'Нет заказов за указанный период' });
 
-  db.query(query, [from, to], async (err, results) => {
-   if (err) {
-  console.error('❌ SQL ошибка:', err);
-  return res.status(500).json({ error: 'Ошибка получения заказов для отчёта' });
-}
-if (results.length === 0) {
-  console.log('⚠️ Нет заказов за выбранный период.');
-  return res.status(404).json({ error: 'Нет заказов за указанный период' });
-}
-
-
-    try {
-      const filePath = await generateReportDocx(results, from, to);
-      res.download(filePath, 'Отчёт_по_заказам.docx');
-    } catch (e) {
-      console.error('Ошибка генерации отчёта:', e.message);
-      res.status(500).json({ error: 'Не удалось сгенерировать отчёт' });
-    }
-  });
+    const filePath = await generateReportDocx(results, from, to);
+    res.download(filePath, 'Отчёт_по_заказам.docx');
+  } catch (err) {
+    console.error('Ошибка генерации отчёта:', err.message);
+    res.status(500).json({ error: 'Не удалось сгенерировать отчёт' });
+  }
+});
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log(`🚀 Сервер запущен на порту ${PORT}`);
 });
