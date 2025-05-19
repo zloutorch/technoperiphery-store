@@ -378,7 +378,8 @@ app.post('/api/admin/send-check/:orderId', async (req, res) => {
 
 // Сформировать отчёт
 app.post('/api/admin/generate-report', async (req, res) => {
-  const { from, to } = req.body;
+  const { from, to, status } = req.body;
+
   try {
     const [results] = await db.query(`
       SELECT o.id, o.created_at, o.total_price, u.name, u.email, p.name AS product_name, p.price
@@ -387,7 +388,9 @@ app.post('/api/admin/generate-report', async (req, res) => {
       JOIN order_items oi ON o.id = oi.order_id
       JOIN products p ON oi.product_id = p.id
       WHERE o.created_at BETWEEN ? AND ?
+      AND (? IS NULL OR o.delivery_status = ?)
       ORDER BY o.created_at DESC
+      
     `, [from, to]);
 
     if (!results.length) return res.status(404).json({ error: 'Нет заказов за указанный период' });
