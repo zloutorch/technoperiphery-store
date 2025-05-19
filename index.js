@@ -376,24 +376,35 @@ app.post('/api/admin/send-check/:orderId', async (req, res) => {
   }
 });
 
+
 // Сформировать отчёт
 app.post('/api/admin/generate-report', async (req, res) => {
   const { from, to, status } = req.body;
 
   try {
-    const [results] = await db.query(`
+    let query = `
       SELECT o.id, o.created_at, o.total_price, u.name, u.email, p.name AS product_name, p.price
       FROM orders o
       JOIN users u ON o.user_id = u.id
       JOIN order_items oi ON o.id = oi.order_id
       JOIN products p ON oi.product_id = p.id
       WHERE o.created_at BETWEEN ? AND ?
-      AND (? IS NULL OR o.delivery_status = ?)
-      ORDER BY o.created_at DESC
-      
-    `, [from, to]);
+    `;
 
-    if (!results.length) return res.status(404).json({ error: 'Нет заказов за указанный период' });
+    const params = [from, to];
+
+    if (status) {
+      query += ` AND o.delivery_status = ?`;
+      params.push(status);
+    }
+
+    query += ` ORDER BY o.created_at DESC`;
+
+    const [results] = await db.query(query, params);
+
+    if (!results.length) {
+      return res.status(404).json({ error: 'Нет заказов за указанный период' });
+    }
 
     const filePath = await generateReportDocx(results, from, to);
     res.download(filePath, 'Отчёт_по_заказам.docx');
@@ -402,6 +413,7 @@ app.post('/api/admin/generate-report', async (req, res) => {
     res.status(500).json({ error: 'Не удалось сгенерировать отчёт' });
   }
 });
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`🚀 Сервер запущен на порту ${PORT}`);
